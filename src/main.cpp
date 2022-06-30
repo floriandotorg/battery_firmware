@@ -1,23 +1,15 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFiNINA.h>
-#include <SoftwareSerial.h>
 #include <avr/wdt.h>
 #include <limits.h>
-#include "DPM8600.h"
+#include "config.h"
 
-SoftwareSerial bmsSerial(13, 12);
+const UartClass &bmsSerial = Serial1;
 
-SoftwareSerial softwareSerial(10, 11);
-Stream *serials[] = { &softwareSerial, &Serial1 };
-
-DPM8600 dpms[] = { DPM8600(2), DPM8600(1) };
-const int NUM_DPMS = sizeof(dpms) / sizeof(dpms[0]);
-
-const char ssid[] = "***REMOVED***";
-const char pass[] = "***REMOVED***";
-
-const pin_size_t DISCHARGE_RELAIS_PIN = LED_BUILTIN;
+const pin_size_t MAIN_RELAIS_PIN = 2;
+const pin_size_t CHARGE_RELAIS_PIN[] = {13, 12, 11, 10};
+const size_t NUM_CHARGE_RELAIS_PINS = sizeof(CHARGE_RELAIS_PIN) / sizeof(pin_size_t);
 
 int status = WL_IDLE_STATUS;
 WiFiServer server(48263);
@@ -59,10 +51,16 @@ uint16_t getBmsPaketChecksum(BmsPacket &paket) {
   return (sum + paket.header.dataLength - 1) ^ 0xFFFF;
 }
 
-bool getBmsBasicInfo(BmsBasicInfo &info) {
-  softwareSerial.stopListening();
-  bmsSerial.listen();
+enum BmsError {
+  NO_ERROR = 0,
 
+  MAGIC_ERROR = 1,
+  TYPE_ERROR = 2,
+  STATUS_ERROR = 3,
+  CHECKSUM_ERROR = 4
+};
+
+BmsError getBmsBasicInfo(BmsBasicInfo &info) {
   uint8_t reqMessage[] = { 0x00, 0xDD, 0xA5, 0x03, 0x00, 0xFF, 0xFD, 0x77 };
   bmsSerial.write(reqMessage, sizeof(reqMessage));
 
@@ -91,22 +89,22 @@ bool getBmsBasicInfo(BmsBasicInfo &info) {
 
   if (paket.header.magic != 0xDD) {
     Serial.println("Magic not okay");
-    goto error;
+    return MAGIC_ERROR;
   }
 
   if (paket.header.type != 3) {
     Serial.println("Type not okay");
-    goto error;
+    return TYPE_ERROR;
   }
 
   if (paket.header.status != 0) {
     Serial.println("Status not okay");
-    goto error;
+    return STATUS_ERROR;
   }
 
   if (getBmsPaketChecksum(paket) != __builtin_bswap16(paket.checksum)) {
     Serial.println("Checksum not okay");
-    goto error;
+    return CHECKSUM_ERROR;
   }
 
   info.volts = __builtin_bswap16(paket.info.volts);
@@ -119,15 +117,7 @@ bool getBmsBasicInfo(BmsBasicInfo &info) {
   info.temp3 = __builtin_bswap16(paket.info.temp3) - 2731;
   info.capacityRemainPercent = paket.info.capacityRemainPercent;
 
-  bmsSerial.stopListening();
-  softwareSerial.listen();
-
-  return true;
-
-error:
-  bmsSerial.stopListening();
-  softwareSerial.listen();
-  return false;
+  return NO_ERROR;
 }
 
 void printBmsInfo(BmsBasicInfo info) {
@@ -191,19 +181,13 @@ void setup() {
   }
 
   Serial1.begin(9600);
-  while (!Serial1);
+  while(!Serial1);
 
-  bmsSerial.begin(9600);
-  while(!bmsSerial);
-
-  softwareSerial.begin(9600);
-  while (!softwareSerial);
-
-  for (int n = 0; n < NUM_DPMS; ++n) {
-    dpms[n].begin(serials[n]);
+  pinMode(MAIN_RELAIS_PIN, OUTPUT);
+  for (size_t n = 0; n < NUM_CHARGE_RELAIS_PINS; ++n) {
+    pinMode(CHARGE_RELAIS_PIN[n], OUTPUT);
+    digitalWrite(CHARGE_RELAIS_PIN[n], HIGH);
   }
-
-  pinMode(DISCHARGE_RELAIS_PIN, OUTPUT);
 
   if (WiFi.status() == WL_NO_MODULE) {
     Serial.println("Communication with WiFi module failed!");
@@ -246,8 +230,9 @@ void loop() {
 
   if ((unsigned long)(millis() - lastApiCallShutdown) >= 5ul*60ul*1000ul) {
     Serial.println("===> 5 mins without api call, turning everything off");
-    for (int n = 0; n < NUM_DPMS; ++n) {
-      dpms[n].power(false);
+    digitalWrite(MAIN_RELAIS_PIN, LOW);
+    for (size_t n = 0; n < NUM_CHARGE_RELAIS_PINS; ++n) {
+      digitalWrite(CHARGE_RELAIS_PIN[n], HIGH);
     }
     lastApiCallShutdown = millis();
   }
@@ -291,47 +276,23 @@ void loop() {
             break;
           } else {
             // Serial.println(currentLine);
+
+            /////// POST
             if (currentLine.startsWith("POST")) {
-              if (currentLine.indexOf("/vc/") > -1) {
-                int n = -1, v = 0, c = 0;
-                if (sscanf(currentLine.c_str(), "POST /vc/%d/%d/%d", &n, &v, &c) != 3) {
+              if (currentLine.indexOf("/cr/") > -1) {
+                int d;
+                if (sscanf(currentLine.c_str(), "POST /cr/%d", &d) != 1) {
                   statusCode = 404;
                   response = "parameter malformed";
                 } else {
-                  if (n > -1 && n < NUM_DPMS) {
-                    int err = dpms[n].writeVC(v / 1000.0, c / 1000.0);
-                    if (err < 0) {
-                      statusCode = 500;
-                      response += "{"
-                        "\"err\": " + String(err) +
-                      "}";
-                    } else {
-                      statusCode = 200;
-                    }
-                  } else {
+                  if (d < 0 || d >= pow(2, NUM_CHARGE_RELAIS_PINS)) {
                     statusCode = 404;
-                    response = "dpm not found";
-                  }
-                }
-              } else if (currentLine.indexOf("/p/") > -1) {
-                int p = 0, n = -1;
-                if (sscanf(currentLine.c_str(), "POST /p/%d/%d", &n, &p) != 2) {
-                  statusCode = 404;
-                  response = "parameter malformed";
-                } else {
-                  if (n > -1 && n < NUM_DPMS) {
-                    int err = dpms[n].power(p);
-                    if (err < 0) {
-                      statusCode = 500;
-                      response += "{"
-                        "\"err\": " + String(err) +
-                      "}";
-                    } else {
-                      statusCode = 200;
-                    }
+                    response = "parameter out of range";
                   } else {
-                    statusCode = 404;
-                    response = "dpm not found";
+                    for (size_t n = 0; n < NUM_CHARGE_RELAIS_PINS; ++n) {
+                      digitalWrite(CHARGE_RELAIS_PIN[n], !(d & (1 << n)));
+                    }
+                    statusCode = 200;
                   }
                 }
               } else if (currentLine.indexOf("/r/") > -1) {
@@ -341,7 +302,7 @@ void loop() {
                   response = "parameter malformed";
                 } else {
                   if (n == 0) {
-                    digitalWrite(DISCHARGE_RELAIS_PIN, r == 1 ? HIGH : LOW);
+                    digitalWrite(MAIN_RELAIS_PIN, r == 1 ? HIGH : LOW);
                     statusCode = 200;
                   } else {
                     statusCode = 404;
@@ -352,43 +313,28 @@ void loop() {
                 statusCode = 404;
                 response = "POST not supported";
               }
-            } else if (currentLine.startsWith("GET")) {
-              if (currentLine.indexOf("/vc") > -1) {
-                int n = -1;
-                if (sscanf(currentLine.c_str(), "GET /vc/%d", &n) != 1) {
-                  statusCode = 404;
-                  response = "parameter malformed";
-                } else {
-                  if (n > -1 && n < NUM_DPMS) {
-                    float v = dpms[n].read('V');
-                    float c = dpms[n].read('C');
 
-                    if (v < 0 || c < 0) {
-                      statusCode = 500;
-                      response += "{"
-                        "\"errV\": " + String(v) + ", "
-                        "\"errC\": " + String(c) +
-                      "}";
-                    } else {
-                      statusCode = 200;
-                      response += "{"
-                        "\"v\": " + String(v) + ", "
-                        "\"c\": " + String(c) +
-                      "}";
-                    }
-                  } else {
-                    statusCode = 404;
-                    response = "dpm not found";
-                  }
-                }
-              } else if (currentLine.indexOf("/b ") > -1) {
+            /////// GET
+            } else if (currentLine.startsWith("GET")) {
+              if (currentLine.indexOf("/b ") > -1) {
                 BmsBasicInfo info;
-                if (getBmsBasicInfo(info)) {
+                BmsError err = getBmsBasicInfo(info);
+                if (err == NO_ERROR) {
                   statusCode = 200;
-                  response = "{ \"b\": " + String(info.capacityRemainPercent) + " }";
+                  response = "{ \"b\": " + String(info.capacityRemainPercent) + ", \"v\":" + String(info.volts) + ", \"c\":" + String(info.amps) + " }";
                 } else {
                   statusCode = 500;
-                  response = "bms communication error";
+                  if (err == MAGIC_ERROR) {
+                    response = "bms communication error: magic not okay";
+                  } else if (err == TYPE_ERROR) {
+                    response = "bms communication error: type not okay";
+                  } else if (err == STATUS_ERROR) {
+                    response = "bms communication error: status not okay";
+                  } else if (err == CHECKSUM_ERROR) {
+                    response = "bms communication error: checksum not okay";
+                  } else {
+                    response = "bms communication error: unknown";
+                  }
                 }
               } else {
                 statusCode = 404;
